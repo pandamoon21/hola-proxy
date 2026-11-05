@@ -320,51 +320,85 @@ func doReqViaHTTPSProxy(ctx context.Context, proxy *url.URL, next ContextDialer,
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Origin", EXT_ORIGIN)
 	req.Header.Set("Accept-Language", ACCEPT_LANGUAGE)
-	// No explicit Accept-Encoding: the transport advertises gzip itself and
-	// transparently decompresses only when it did so.
-	//
-	// Force HTTP/2 like the extension. A plain http.Transport cannot
-	// negotiate h2 over a utls conn (ConnectionState type differs from
-	// crypto/tls), so use http2.Transport with a custom dialer and fail
-	// the dial if the endpoint does not speak h2.
-	tr2 := &http2.Transport{
-		AllowHTTP: false,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *stdtls.Config) (net.Conn, error) {
-			conn, err := pd.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			host, _, err := net.SplitHostPort(addr)
-			if err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("hostname extraction error: %w", err)
-			}
-			tlsConn := tls.UClient(conn, &tls.Config{
-				ServerName: host,
-				RootCAs:    caPool,
-				NextProtos: []string{"h2"},
-			}, tls.HelloChrome_Auto)
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("UClient handshake failed: %w", err)
-			}
-			if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
-				tlsConn.Close()
-				return nil, errors.New("endpoint does not negotiate HTTP/2")
-			}
-			return tlsConn, nil
-		},
+
+	// Try HTTP/2 first, like the extension. A plain http.Transport cannot
+	// negotiate h2 over a utls conn (its ConnectionState type differs from
+	// crypto/tls), so h2 goes through http2.Transport with a custom dialer.
+	// Not every proxy or zagent speaks h2; when the ALPN result is not h2 we
+	// fall back to HTTP/1.1 over the same Chrome ClientHello instead of
+	// failing the whole attempt.
+	respBody, negotiated, err := doReqChrome(ctx, req, pd, "h2")
+	if err == nil && negotiated {
+		return respBody, nil
 	}
-	defer tr2.CloseIdleConnections()
-	resp, err := (&http.Client{Transport: tr2}).Do(req)
-	if err != nil {
+	if err != nil && !errors.Is(err, errNoHTTP2) {
 		return nil, err
+	}
+	respBody, _, err = doReqChrome(ctx, req, pd, "http/1.1")
+	return respBody, err
+}
+
+// errNoHTTP2 signals that the peer negotiated something other than h2, so the
+// caller may retry with HTTP/1.1.
+var errNoHTTP2 = errors.New("endpoint does not negotiate HTTP/2")
+
+// doReqChrome sends req through pd using a Chrome ClientHello that offers
+// only alpn. With alpn "h2" it reports whether HTTP/2 was negotiated; with
+// "http/1.1" the h2 check is skipped.
+func doReqChrome(ctx context.Context, req *http.Request, pd *ProxyDialer, alpn string) (body []byte, negotiatedH2 bool, err error) {
+	req = req.Clone(ctx)
+	dialTLS := func(ctx context.Context, network, addr string, _ *stdtls.Config) (net.Conn, error) {
+		conn, err := pd.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("hostname extraction error: %w", err)
+		}
+		tlsConn := tls.UClient(conn, &tls.Config{
+			ServerName: host,
+			RootCAs:    caPool,
+			NextProtos: []string{alpn},
+		}, tls.HelloChrome_Auto)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("UClient handshake failed: %w", err)
+		}
+		if alpn == "h2" && tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+			tlsConn.Close()
+			return nil, errNoHTTP2
+		}
+		return tlsConn, nil
+	}
+	var transport http.RoundTripper
+	if alpn == "h2" {
+		tr2 := &http2.Transport{AllowHTTP: false, DialTLSContext: dialTLS}
+		defer tr2.CloseIdleConnections()
+		transport = tr2
+	} else {
+		// Let the transport own the TLS handshake (already Chrome-shaped by
+		// dialTLS) and decode the response body as it advertises.
+		tr1 := &http.Transport{
+			ForceAttemptHTTP2: false,
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialTLS(ctx, network, addr, nil)
+			},
+		}
+		defer tr1.CloseIdleConnections()
+		transport = tr1
+	}
+	resp, err := (&http.Client{Transport: transport}).Do(req)
+	if err != nil {
+		return nil, false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 204 {
-		return nil, fmt.Errorf("bad HTTP response: %s", resp.Status)
+		return nil, false, fmt.Errorf("bad HTTP response: %s", resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
+	return body, alpn == "h2", err
 }
 
 func VPNCountries(ctx context.Context, proxyURL, extVer string) (res CountryList, err error) {
