@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 
 	tls "github.com/refraction-networking/utls"
@@ -21,7 +22,13 @@ const (
 	PROXY_CONNECT_METHOD       = "CONNECT"
 	PROXY_HOST_HEADER          = "Host"
 	PROXY_AUTHORIZATION_HEADER = "Proxy-Authorization"
+	PROXY_CONNECTION_HEADER    = "Proxy-Connection"
+	PROXY_HOLA_HOST_HEADER     = "Proxy-Host"
 )
+
+// PROXY_CONNECT_HOST_HEADER is the special Host value Hola's extension uses
+// when it asks a zagent for a tunnel.
+const PROXY_CONNECT_HOST_VALUE = "-"
 
 var UpstreamBlockedError = errors.New("blocked by upstream")
 
@@ -125,26 +132,17 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		}, tls.HelloChrome_Auto)
 	}
 
-	req := &http.Request{
-		Method:     PROXY_CONNECT_METHOD,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		RequestURI: address,
-		Host:       address,
-		Header: http.Header{
-			PROXY_HOST_HEADER: []string{address},
-		},
-	}
-
+	var authHeader string
 	if d.auth != nil {
-		req.Header.Set(PROXY_AUTHORIZATION_HEADER, d.auth())
+		authHeader = d.auth()
 	}
+	req := buildProxyConnectRequest(address, authHeader)
 
 	rawreq, err := httputil.DumpRequest(req, false)
 	if err != nil {
 		return nil, err
 	}
+	rawreq = orderRequestHeaders(rawreq, PROXY_HEADER_ORDER)
 
 	_, err = conn.Write(rawreq)
 	if err != nil {
@@ -165,6 +163,95 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	}
 
 	return conn, nil
+}
+
+// buildProxyConnectRequest builds a CONNECT request shaped like the one
+// Hola's browser extension sends to a zagent: Host "-", the tunnel target in
+// Proxy-Host, Proxy-Connection and the extension headers. Nested proxies (our
+// own -proxy, or a fallback agent in front of ours) check all of these before
+// accepting the credentials; with Go's default headers the agent answers
+// "407 Auth Failed suspicious".
+func buildProxyConnectRequest(address, authHeader string) *http.Request {
+	req := &http.Request{
+		Method:     PROXY_CONNECT_METHOD,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		RequestURI: address,
+		Host:       PROXY_CONNECT_HOST_VALUE,
+		Header: http.Header{
+			PROXY_HOST_HEADER: []string{PROXY_CONNECT_HOST_VALUE},
+		},
+	}
+	req.Header.Set(PROXY_CONNECTION_HEADER, "Keep-Alive")
+	req.Header.Set(PROXY_HOLA_HOST_HEADER, address)
+	req.Header.Set("Origin", EXT_ORIGIN)
+	req.Header.Set("Accept-Encoding", ACCEPT_ENCODING)
+	req.Header.Set("Accept-Language", ACCEPT_LANGUAGE)
+	if authHeader != "" {
+		req.Header.Set(PROXY_AUTHORIZATION_HEADER, authHeader)
+	}
+	return req
+}
+
+// orderRequestHeaders rewrites the header block of a dumped HTTP request so
+// that headers listed in order come first, in that order, and the rest keep
+// their original relative order (mirrors the CycleTLS HeaderOrder behaviour
+// used for API requests).
+func orderRequestHeaders(raw []byte, order []string) []byte {
+	sep := []byte("\r\n\r\n")
+	i := bytes.Index(raw, sep)
+	if i < 0 {
+		return raw
+	}
+	head, rest := raw[:i], raw[i+len(sep):]
+	lines := bytes.Split(head, []byte("\r\n"))
+	if len(lines) < 2 {
+		return raw
+	}
+	start := 1
+	for start < len(lines) && (lines[start][0] == ' ' || lines[start][0] == '\t') {
+		start++
+	}
+	header := lines[start:]
+	rank := make(map[string]int, len(order))
+	for i, name := range order {
+		rank[name] = i
+	}
+	// Stable partition: known headers first (by rank), unknown afterwards.
+	keyed := make([]string, len(header))
+	for i, h := range header {
+		keyed[i] = strings.ToLower(string(bytes.SplitN(h, []byte(":"), 2)[0]))
+	}
+	idx := make([]int, len(header))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		ra, oka := rank[keyed[idx[a]]]
+		rb, okb := rank[keyed[idx[b]]]
+		switch {
+		case oka && okb:
+			return ra < rb
+		case oka:
+			return true
+		case okb:
+			return false
+		}
+		return false
+	})
+	out := &bytes.Buffer{}
+	for _, l := range lines[:start] {
+		out.Write(l)
+		out.WriteString("\r\n")
+	}
+	for _, i := range idx {
+		out.Write(header[i])
+		out.WriteString("\r\n")
+	}
+	out.WriteString("\r\n")
+	out.Write(rest)
+	return out.Bytes()
 }
 
 func (d *ProxyDialer) Dial(network, address string) (net.Conn, error) {

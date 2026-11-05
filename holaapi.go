@@ -45,6 +45,23 @@ const ACCEPT_LANGUAGE = "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
 // decompress (gzip, deflate, br - no zstd support upstream).
 const ACCEPT_ENCODING = "gzip, deflate, br"
 
+// PROXY_HEADER_ORDER is the order Hola's own extension sends the hop-by-hop
+// CONNECT request to a zagent. It differs from HEADER_ORDER: no browser
+// headers there, but Proxy-Authorization right after Content-Type, and
+// Proxy-Connection / Proxy-Host which Chrome emits for proxy requests.
+var PROXY_HEADER_ORDER = []string{
+	"host",
+	"proxy-connection",
+	"content-length",
+	"content-type",
+	"origin",
+	"proxy-authorization",
+	"user-agent",
+	"accept-encoding",
+	"accept-language",
+	"proxy-host",
+}
+
 var HEADER_ORDER = []string{
 	"host",
 	"connection",
