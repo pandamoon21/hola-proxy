@@ -57,10 +57,12 @@ func (s *ProxyHandler) HandleTunnel(wr http.ResponseWriter, req *http.Request) {
 		http.Error(wr, "Can't satisfy CONNECT request", http.StatusBadGateway)
 		return
 	}
+	// proxy()/proxyh2() close conn too; this covers the early-return paths.
+	defer conn.Close()
 
 	if req.ProtoMajor == 0 || req.ProtoMajor == 1 {
 		// Upgrade client connection
-		localconn, _, err := hijack(wr)
+		localconn, rw, err := hijack(wr)
 		if err != nil {
 			s.logger.Error("Can't hijack client connection: %v", err)
 			http.Error(wr, "Can't hijack client connection", http.StatusInternalServerError)
@@ -70,6 +72,16 @@ func (s *ProxyHandler) HandleTunnel(wr http.ResponseWriter, req *http.Request) {
 
 		// Inform client connection is built
 		fmt.Fprintf(localconn, "HTTP/%d.%d 200 OK\r\n\r\n", req.ProtoMajor, req.ProtoMinor)
+
+		// Forward bytes the client pipelined after the CONNECT headers
+		// (e.g. a TLS ClientHello); they are already in the hijacked buffer.
+		if n := rw.Reader.Buffered(); n > 0 {
+			buffered, _ := rw.Reader.Peek(n)
+			if _, err := conn.Write(buffered); err != nil {
+				s.logger.Error("Can't forward buffered client data: %v", err)
+				return
+			}
+		}
 
 		proxy(req.Context(), localconn, conn)
 	} else if req.ProtoMajor == 2 {
@@ -97,7 +109,7 @@ func (s *ProxyHandler) HandleRequest(wr http.ResponseWriter, req *http.Request) 
 	resp, err := s.httptransport.RoundTrip(req)
 	if err != nil {
 		s.logger.Error("HTTP fetch error: %v", err)
-		http.Error(wr, "Server Error", http.StatusInternalServerError)
+		http.Error(wr, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
