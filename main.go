@@ -305,28 +305,31 @@ func run() int {
 		return 6
 	}
 
-	var (
-		auth    AuthProvider
-		tunnels *ZGetTunnelsResponse
-	)
+	// Validate the port type before registering, so a bad flag fails fast
+	// instead of being retried as a network error.
+	port, err := portSelector(args.proxy_type, args.use_trial, args.force_port_field)
+	if err != nil {
+		mainLogger.Critical("Unable to determine proxy endpoint: %v", err)
+		return 5
+	}
+
+	var pool *UpstreamPool
 	err = try("run credentials service", func() error {
-		auth, tunnels, err = CredService(args.rotate, args.timeout, args.extVer, args.country,
-			args.proxy_type, credLogger, args.backoffInitial, args.backoffDeadline, args.proxy)
+		pool, err = CredService(args.rotate, args.timeout, args.extVer, args.country,
+			args.proxy_type, port, credLogger, args.backoffInitial, args.backoffDeadline, args.proxy)
 		return err
 	})
 	if err != nil {
 		return 4
 	}
-	endpoint, err := get_endpoint(tunnels, args.proxy_type, args.use_trial, args.force_port_field)
-	if err != nil {
-		mainLogger.Critical("Unable to determine proxy endpoint: %v", err)
-		return 5
-	}
-	handlerDialer := NewProxyDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, auth, args.hideSNI, dialer)
-	requestDialer := NewPlaintextDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, args.hideSNI, dialer)
-	mainLogger.Info("Endpoint: %s", endpoint.URL().String())
+	handlerDialer := NewFailoverDialer(pool, func(ep *Endpoint) ContextDialer {
+		return NewProxyDialer(ep.NetAddr(), ep.TLSName, caPool, pool.Auth, args.hideSNI, dialer)
+	}, proxyLogger)
+	requestDialer := NewFailoverDialer(pool, func(ep *Endpoint) ContextDialer {
+		return NewPlaintextDialer(ep.NetAddr(), ep.TLSName, caPool, args.hideSNI, dialer)
+	}, proxyLogger)
 	mainLogger.Info("Starting proxy server...")
-	handler := NewProxyHandler(handlerDialer, requestDialer, auth, args.proxyAuth, resolver, proxyLogger)
+	handler := NewProxyHandler(handlerDialer, requestDialer, pool.Auth, args.proxyAuth, resolver, proxyLogger)
 	mainLogger.Info("Init complete.")
 	// Only ReadHeaderTimeout is set: other server timeouts would cut
 	// long-lived tunnels and streaming responses.

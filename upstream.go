@@ -178,10 +178,20 @@ func (d *ProxyDialer) connect(ctx context.Context, rawConn net.Conn, address str
 			proxyResp.Header.Get("X-Hola-Error") == "Forbidden Host" {
 			return nil, UpstreamBlockedError
 		}
-		return nil, errors.New(fmt.Sprintf("bad response from upstream proxy server: %s", proxyResp.Status))
+		return nil, &UpstreamStatusError{Status: proxyResp.Status}
 	}
 
 	return conn, nil
+}
+
+// UpstreamStatusError is a non-200 answer to CONNECT: the proxy is reachable
+// but refused or failed this particular tunnel.
+type UpstreamStatusError struct {
+	Status string
+}
+
+func (e *UpstreamStatusError) Error() string {
+	return fmt.Sprintf("bad response from upstream proxy server: %s", e.Status)
 }
 
 // verifyPeerTLSConfig returns a TLS config that verifies the peer chain
