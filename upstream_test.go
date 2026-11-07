@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	tls "github.com/refraction-networking/utls"
 )
 
 func TestOrderRequestHeaders(t *testing.T) {
@@ -43,6 +45,19 @@ func TestProxyConnectRequestShape(t *testing.T) {
 	}
 	if !strings.HasPrefix(req.Header.Get("Proxy-Authorization"), "Basic ") {
 		t.Fatal("expected Basic scheme")
+	}
+}
+
+func TestVerifyPeerTLSConfig(t *testing.T) {
+	cfg := verifyPeerTLSConfig("example.com", true, nil)
+	if cfg.ServerName != "" || !cfg.InsecureSkipVerify {
+		t.Fatalf("expected hidden SNI with custom verification, got %q %v", cfg.ServerName, cfg.InsecureSkipVerify)
+	}
+	if err := cfg.VerifyConnection(tls.ConnectionState{}); err == nil {
+		t.Fatal("expected error when the peer presents no certificate")
+	}
+	if cfg := verifyPeerTLSConfig("example.com", false, nil); cfg.ServerName != "example.com" {
+		t.Fatalf("expected SNI example.com, got %q", cfg.ServerName)
 	}
 }
 

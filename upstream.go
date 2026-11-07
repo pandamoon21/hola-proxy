@@ -144,29 +144,7 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 func (d *ProxyDialer) connect(ctx context.Context, rawConn net.Conn, address string) (net.Conn, error) {
 	conn := rawConn
 	if d.tlsServerName != "" {
-		// Custom cert verification logic:
-		// DO NOT send SNI extension of TLS ClientHello
-		// DO peer certificate verification against specified servername
-		sni := d.tlsServerName
-		if d.hideSNI {
-			sni = ""
-		}
-		tlsConn := tls.UClient(conn, &tls.Config{
-			ServerName:         sni,
-			InsecureSkipVerify: true,
-			VerifyConnection: func(cs tls.ConnectionState) error {
-				opts := x509.VerifyOptions{
-					DNSName:       d.tlsServerName,
-					Intermediates: x509.NewCertPool(),
-					Roots:         d.caPool,
-				}
-				for _, cert := range cs.PeerCertificates[1:] {
-					opts.Intermediates.AddCert(cert)
-				}
-				_, err := cs.PeerCertificates[0].Verify(opts)
-				return err
-			},
-		}, tls.HelloChrome_Auto)
+		tlsConn := tls.UClient(conn, verifyPeerTLSConfig(d.tlsServerName, d.hideSNI, d.caPool), tls.HelloChrome_Auto)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			return nil, err
 		}
@@ -204,6 +182,35 @@ func (d *ProxyDialer) connect(ctx context.Context, rawConn net.Conn, address str
 	}
 
 	return conn, nil
+}
+
+// verifyPeerTLSConfig returns a TLS config that verifies the peer chain
+// against serverName and caPool itself, so that SNI can be left out of the
+// ClientHello when hideSNI is set.
+func verifyPeerTLSConfig(serverName string, hideSNI bool, caPool *x509.CertPool) *tls.Config {
+	sni := serverName
+	if hideSNI {
+		sni = ""
+	}
+	return &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("upstream presented no TLS certificate")
+			}
+			opts := x509.VerifyOptions{
+				DNSName:       serverName,
+				Intermediates: x509.NewCertPool(),
+				Roots:         caPool,
+			}
+			for _, cert := range cs.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+			_, err := cs.PeerCertificates[0].Verify(opts)
+			return err
+		},
+	}
 }
 
 // buildProxyConnectRequest builds a CONNECT request shaped like the one
