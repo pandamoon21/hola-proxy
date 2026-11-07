@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	tls "github.com/refraction-networking/utls"
 )
@@ -101,11 +102,47 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		return nil, errors.New("bad network specified for DialContext: only tcp is supported")
 	}
 
-	conn, err := d.next.DialContext(ctx, "tcp", d.address)
+	rawConn, err := d.next.DialContext(ctx, "tcp", d.address)
 	if err != nil {
 		return nil, err
 	}
 
+	// Bound the handshake and CONNECT exchange by ctx: apply its deadline and
+	// abort blocked I/O on cancellation by forcing an expired deadline.
+	if dl, ok := ctx.Deadline(); ok {
+		rawConn.SetDeadline(dl)
+	}
+	stop := context.AfterFunc(ctx, func() {
+		rawConn.SetDeadline(time.Unix(1, 0))
+	})
+
+	conn, err := d.connect(ctx, rawConn, address)
+	if !stop() && err == nil {
+		// ctx ended and the watcher has run or is running, so it may still
+		// expire the conn's deadline after we clear it.
+		err = ctx.Err()
+	}
+	if err != nil {
+		rawConn.Close()
+		if err != UpstreamBlockedError {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			// The conn deadline can expire just before ctx marks itself done.
+			if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+				return nil, context.DeadlineExceeded
+			}
+		}
+		return nil, err
+	}
+	rawConn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+// connect performs the optional TLS handshake and the CONNECT exchange on
+// rawConn. The caller owns rawConn and closes it on error.
+func (d *ProxyDialer) connect(ctx context.Context, rawConn net.Conn, address string) (net.Conn, error) {
+	conn := rawConn
 	if d.tlsServerName != "" {
 		// Custom cert verification logic:
 		// DO NOT send SNI extension of TLS ClientHello
@@ -114,7 +151,7 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		if d.hideSNI {
 			sni = ""
 		}
-		conn = tls.UClient(conn, &tls.Config{
+		tlsConn := tls.UClient(conn, &tls.Config{
 			ServerName:         sni,
 			InsecureSkipVerify: true,
 			VerifyConnection: func(cs tls.ConnectionState) error {
@@ -130,6 +167,10 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 				return err
 			},
 		}, tls.HelloChrome_Auto)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		conn = tlsConn
 	}
 
 	var authHeader string
@@ -258,27 +299,31 @@ func (d *ProxyDialer) Dial(network, address string) (net.Conn, error) {
 	return d.DialContext(context.Background(), network, address)
 }
 
+// maxResponseHeaderBytes caps the CONNECT response header read from an
+// upstream proxy.
+const maxResponseHeaderBytes = 64 * 1024
+
+// readResponse reads a CONNECT response one byte at a time so that no tunnel
+// bytes following the header are consumed.
 func readResponse(r io.Reader, req *http.Request) (*http.Response, error) {
 	endOfResponse := []byte("\r\n\r\n")
 	buf := &bytes.Buffer{}
 	b := make([]byte, 1)
 	for {
 		n, err := r.Read(b)
-		if n < 1 && err == nil {
-			continue
+		if n > 0 {
+			buf.WriteByte(b[0])
+			if bytes.HasSuffix(buf.Bytes(), endOfResponse) {
+				break
+			}
+			if buf.Len() >= maxResponseHeaderBytes {
+				return nil, fmt.Errorf("upstream proxy response header exceeds %d bytes", maxResponseHeaderBytes)
+			}
 		}
-
-		buf.Write(b)
-		sl := buf.Bytes()
-		if len(sl) < len(endOfResponse) {
-			continue
-		}
-
-		if bytes.Equal(sl[len(sl)-4:], endOfResponse) {
-			break
-		}
-
 		if err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
 	}
