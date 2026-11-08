@@ -190,51 +190,6 @@ func print_proxies(try func(string, func() error) error, logger *CondLogger, ext
 	return 0
 }
 
-func get_endpoint(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_port_field string) (*Endpoint, error) {
-	var hostname, ip string
-	for k, v := range tunnels.IPList {
-		hostname = k
-		ip = v
-		break
-	}
-	if hostname == "" || ip == "" {
-		return nil, errors.New("No tunnels found in API response")
-	}
-
-	var port uint16
-	if force_port_field != "" {
-		port2, err := strconv.ParseUint(force_port_field, 0, 16)
-		if err == nil {
-			port = (uint16)(port2)
-			typ = "skip"
-		} else {
-			typ = force_port_field
-		}
-	}
-	if typ != "skip" {
-		if typ == "direct" || typ == "lum" || typ == "pool" || typ == "virt" {
-			if !trial {
-				port = tunnels.Port.Trial
-			} else {
-				port = tunnels.Port.Direct
-			}
-		} else if typ == "peer" {
-			if !trial {
-				port = tunnels.Port.TrialPeer
-			} else {
-				port = tunnels.Port.Peer
-			}
-		} else {
-			return nil, errors.New("Unsupported port type")
-		}
-	}
-	return &Endpoint{
-		Host:    ip,
-		Port:    port,
-		TLSName: hostname,
-	}, nil
-}
-
 // Hop-by-hop headers. These are removed when sent to the backend.
 // http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
 var hopHeaders = []string{

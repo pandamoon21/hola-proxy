@@ -40,29 +40,7 @@ func (d *PlaintextDialer) DialContext(ctx context.Context, network, address stri
 	}
 
 	if d.tlsServerName != "" {
-		// Custom cert verification logic:
-		// DO NOT send SNI extension of TLS ClientHello
-		// DO peer certificate verification against specified servername
-		sni := d.tlsServerName
-		if d.hideSNI {
-			sni = ""
-		}
-		tlsConn := tls.UClient(conn, &tls.Config{
-			ServerName:         sni,
-			InsecureSkipVerify: true,
-			VerifyConnection: func(cs tls.ConnectionState) error {
-				opts := x509.VerifyOptions{
-					DNSName:       d.tlsServerName,
-					Intermediates: x509.NewCertPool(),
-					Roots:         d.caPool,
-				}
-				for _, cert := range cs.PeerCertificates[1:] {
-					opts.Intermediates.AddCert(cert)
-				}
-				_, err := cs.PeerCertificates[0].Verify(opts)
-				return err
-			},
-		}, tls.HelloChrome_Auto)
+		tlsConn := tls.UClient(conn, verifyPeerTLSConfig(d.tlsServerName, d.hideSNI, d.caPool), tls.HelloChrome_Auto)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			conn.Close()
 			return nil, err
